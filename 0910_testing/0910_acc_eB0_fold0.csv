@@ -1,0 +1,6 @@
+level,precision,recall,f1_score,accuracy
+,,,,0.74
+level 0,0.82,0.71,0.76,
+level 1,0.67,0.76,0.71,
+level 2,0.64,0.62,0.63,
+level 3,0.86,0.84,0.85,
