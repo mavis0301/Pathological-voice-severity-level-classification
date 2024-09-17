@@ -160,9 +160,9 @@ def gelu(x):
 if __name__ == "__main__":
     nowDate = '0910'
     sample_rate = 16000
-    wav_path = "your_wav_path/"
-    train_df = pd.read_csv('train.csv', dtype={'ID': str})
-    test_df = pd.read_csv('test.csv', dtype={'ID': str})
+    wav_path = "E13_0705data/"
+    train_df = pd.read_csv('2_fold_data_set/two_fold_1.csv', dtype={'ID': str})
+    test_df = pd.read_csv('2_fold_data_set/two_fold_2.csv', dtype={'ID': str})
     train_df['ID'] = train_df['ID'].astype(str).str.zfill(4)
     test_df['ID'] = test_df['ID'].astype(str).str.zfill(4)
 
