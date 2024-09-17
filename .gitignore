@@ -9,3 +9,4 @@ mel_1130816_fixTrainTest_2fold.ipynb
 *.yml
 *.pth
 *.png
+*.txt

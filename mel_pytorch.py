@@ -1,4 +1,4 @@
-# %% Import 所有必要的庫
+# %%
 import os
 import numpy as np
 import pandas as pd
@@ -15,7 +15,7 @@ import audioflux as af
 import parselmouth
 from parselmouth.praat import call
 
-# 檢查是否可用 GPU
+# 檢查GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
@@ -85,55 +85,25 @@ class SpatialAttention(nn.Module):
         x = self.conv1(x)
         return self.sigmoid(x)
 
-# %% ResNetRS模型定義與注意力機制
-class MultiModalResNetRSWithAttention(nn.Module):
+# %% EfficientNetV2
+class MultiModalEfficientNetV2WithAttention(nn.Module):
     def __init__(self, num_classes=5, dropout_rate=0.5):
-        super(MultiModalResNetRSWithAttention, self).__init__()
-        self.base_model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-        self.base_model.conv1 = nn.Conv2d(3, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)  # 將通道數改為 3
+        super(MultiModalEfficientNetV2WithAttention, self).__init__()
+        self.base_model = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.DEFAULT)
+        self.base_model.classifier[1] = nn.Linear(self.base_model.classifier[1].in_features, num_classes)  # 修改輸出層
 
-        # 注意力模塊，對應 ResNet 各層的輸出通道數
+        # 注意力模塊
         self.ca1 = ChannelAttention(256)
         self.sa1 = SpatialAttention()
         self.ca2 = ChannelAttention(512)
         self.sa2 = SpatialAttention()
-        self.ca3 = ChannelAttention(1024)
-        self.sa3 = SpatialAttention()
-        self.ca4 = ChannelAttention(2048)
-        self.sa4 = SpatialAttention()
 
         self.dropout = nn.Dropout(dropout_rate)
-        self.base_model.fc = nn.Linear(self.base_model.fc.in_features, num_classes)
 
     def forward(self, x):
-        x = self.base_model.conv1(x)
-        x = self.base_model.bn1(x)
-        x = self.base_model.relu(x)
-        x = self.base_model.maxpool(x)
-
-        # ResNet layers + Attention
-        x = self.base_model.layer1(x)
-        x = self.ca1(x) * x
-        x = self.sa1(x) * x
-
-        x = self.base_model.layer2(x)
-        x = self.ca2(x) * x
-        x = self.sa2(x) * x
-
-        x = self.base_model.layer3(x)
-        x = self.ca3(x) * x
-        x = self.sa3(x) * x
-
-        x = self.base_model.layer4(x)
-        x = self.ca4(x) * x
-        x = self.sa4(x) * x
-
-        x = self.base_model.avgpool(x)
-        x = torch.flatten(x, 1)
+        x = self.base_model(x)
         x = self.dropout(x)
-        x = self.base_model.fc(x)
         return x
-
 
 # %% 動態調整 Dropout
 class DynamicDropout(nn.Module):
@@ -169,43 +139,37 @@ def extract_features(file_path, sample_rate):
     # 返回調整後的特徵
     return mel_spec_dB_arr, mfccs_resized, waveform_resized
 
-
-
 # %% 處理音訊
 def process_audio(fileList, sample_rate):
     audio_features = []
     max_height, max_width = 0, 0
 
-    # 首先確定所有樣本中的最大高度和寬度
+    # 確定所有樣本中的最大高度和寬度
     for file in fileList:
         mel_spec, mfccs, waveform = extract_features(file, sample_rate)
-        max_height = max(max_height, mel_spec.shape[0], mfccs.shape[0], waveform.shape[0])  # 找到最大的高度
-        max_width = max(max_width, mel_spec.shape[1], mfccs.shape[1], waveform.shape[1])   # 找到最大的寬度
+        max_height = max(max_height, mel_spec.shape[0], mfccs.shape[0], waveform.shape[0])
+        max_width = max(max_width, mel_spec.shape[1], mfccs.shape[1], waveform.shape[1])
 
     # 將所有特徵統一填充到最大長寬
     for file in fileList:
         mel_spec, mfccs, waveform = extract_features(file, sample_rate)
 
-        # 自動填充高度和寬度到最大值，使用原本數據的重複循環進行填充
         mel_spec_padded = np.pad(mel_spec, ((0, max_height - mel_spec.shape[0]), (0, max_width - mel_spec.shape[1])),
-                                 mode='wrap')  # 使用原數據循環填充
+                                 mode='wrap')
         mfccs_padded = np.pad(mfccs, ((0, max_height - mfccs.shape[0]), (0, max_width - mfccs.shape[1])),
-                              mode='wrap')  # 使用原數據循環填充
+                              mode='wrap')
         waveform_padded = np.pad(waveform, ((0, max_height - waveform.shape[0]), (0, max_width - waveform.shape[1])),
-                                 mode='wrap')  # 使用原數據循環填充
+                                 mode='wrap')
 
-        # 打印形狀進行調試
         print(f"mel_spec_padded shape: {mel_spec_padded.shape}, mfccs_padded shape: {mfccs_padded.shape}, waveform_padded shape: {waveform_padded.shape}")
 
-        # 堆疊 Mel 頻譜, MFCC, waveform，形成 (3, H, W)
         combined_features = np.stack([mel_spec_padded, mfccs_padded, waveform_padded], axis=0)
         audio_features.append(combined_features)
 
     return np.array(audio_features)
 
-
-# %% 訓練與測試函數
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=25, patience=20):
+# %% 訓練與測試
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=25, patience=5):
     model = model.to(device)
     dynamic_dropout = DynamicDropout(0.5)
     early_stopping = EarlyStopping(patience=patience)
@@ -242,7 +206,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         epoch_acc = 100 * correct / total
         print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%")
 
-        # 評估驗證集損失和準確率
         val_loss, val_acc = evaluate_model(model, val_loader, criterion)
         print(f"Epoch {epoch + 1}/{num_epochs}, Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_acc:.2f}%")
 
@@ -256,7 +219,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 
     print("Training complete")
 
-# %% 修正 evaluate_model 函數
+# %%
 def evaluate_model(model, test_loader, criterion=None):
     model.eval()
     y_true, y_pred = [], []
@@ -284,9 +247,9 @@ def evaluate_model(model, test_loader, criterion=None):
         val_loss /= len(test_loader.dataset)
         return val_loss, accuracy
     else:
-        return y_true, y_pred  # 返回正確標籤和預測標籤
+        return y_true, y_pred
 
-# %% 主程式
+# %% MAIN
 if __name__ == "__main__":
     nowDate = '0910'
     sample_rate = 16000
@@ -305,31 +268,31 @@ if __name__ == "__main__":
     train_audio = process_audio(X_train_filename, sample_rate)
     val_audio = process_audio(X_val_filename, sample_rate)
 
-    # 將資料轉為 PyTorch tensor
+    # 轉為 PyTorch tensor
     train_data = torch.tensor(train_audio, dtype=torch.float32)
     train_labels = torch.tensor(y_train_label, dtype=torch.long)
     val_data = torch.tensor(val_audio, dtype=torch.float32)
     val_labels = torch.tensor(y_val_label, dtype=torch.long)
 
-    # 建立 DataLoader
+    # DataLoader
     train_dataset = TensorDataset(train_data, train_labels)
     val_dataset = TensorDataset(val_data, val_labels)
     batch_size = 64
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    # 創建帶有注意力機制和多模態輸入的 ResNetRS 模型
-    model = MultiModalResNetRSWithAttention(num_classes=5, dropout_rate=0.5)
+    # 帶注意力機制和多模態輸入的 EfficientNetV2
+    model = MultiModalEfficientNetV2WithAttention(num_classes=5, dropout_rate=0.5)
 
-    # 定義損失函數和優化器
+    # 損失函數和優化器
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.00003, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
 
-    # 開始訓練
+    # 訓練包括early stop的耐心
     train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=200, patience=5)
 
-    # 評估並保存結果
+    # 評估
     y_true, y_pred = evaluate_model(model, val_loader)
     report = classification_report(y_true, y_pred, target_names=['Class 0', 'Class 1', 'Class 2', 'Class 3'], digits=4)
     print(report)
