@@ -85,25 +85,48 @@ class SpatialAttention(nn.Module):
         x = self.conv1(x)
         return self.sigmoid(x)
 
-# %% EfficientNetV2
-class MultiModalEfficientNetV2WithAttention(nn.Module):
-    def __init__(self, num_classes=5, dropout_rate=0.5):
-        super(MultiModalEfficientNetV2WithAttention, self).__init__()
-        self.base_model = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.DEFAULT)
-        self.base_model.classifier[1] = nn.Linear(self.base_model.classifier[1].in_features, num_classes)  # 修改輸出層
+# %% CRNN 模型
+class CRNN(nn.Module):
+    def __init__(self, num_classes=5, dropout_rate=0.5, lstm_hidden_size=128, lstm_num_layers=2):
+        super(CRNN, self).__init__()
+        # 卷積部分
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(9, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
 
-        # 注意力模塊
-        self.ca1 = ChannelAttention(256)
-        self.sa1 = SpatialAttention()
-        self.ca2 = ChannelAttention(512)
-        self.sa2 = SpatialAttention()
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
 
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+
+        # LSTM部分
+        self.lstm = nn.LSTM(input_size=64, hidden_size=lstm_hidden_size, num_layers=lstm_num_layers, batch_first=True)
+
+        # 全連接層分類
+        self.classifier = nn.Linear(lstm_hidden_size, num_classes)
         self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, x):
-        x = self.base_model(x)
+        # 卷積層
+        x = self.conv_layers(x)
+        # 將卷積層輸出 reshape 成 (batch_size, 序列長度, 特徵數)
+        x = x.view(x.size(0), -1, x.size(1))
+        # LSTM
+        x, _ = self.lstm(x)
+        # 使用最後一個時間步的輸出作為分類的輸入
+        x = x[:, -1, :]
         x = self.dropout(x)
+        x = self.classifier(x)
         return x
+
 
 # %% 動態調整 Dropout
 class DynamicDropout(nn.Module):
@@ -117,56 +140,166 @@ class DynamicDropout(nn.Module):
     def update_dropout_rate(self, epoch, decay_factor=0.99):
         self.dropout_rate = max(0.1, self.dropout_rate * decay_factor ** epoch)
 
-# %% 特徵處理：Mel 頻譜、MFCC、waveform
-def extract_features(file_path, sample_rate):
+
+# %% 數據增強函數
+def time_stretch(data, rate=1.0):
+    return librosa.effects.time_stretch(data, rate=rate)
+
+def pitch_shift(data, sr, n_steps=0):
+    return librosa.effects.pitch_shift(data, sr=sr, n_steps=n_steps)
+
+def add_noise(data, noise_factor=0.005):
+    noise = np.random.randn(len(data))
+    augmented_data = data + noise_factor * noise
+    return augmented_data
+
+def time_shift(data, shift_max=0.2):
+    shift = np.random.randint(len(data) * shift_max)
+    augmented_data = np.roll(data, shift)
+    return augmented_data
+
+def apply_convolution(data, ir_signal):
+    return np.convolve(data, ir_signal, mode='same')
+
+def spec_augment(spec, num_mask=2, freq_masking_max_percentage=0.15, time_masking_max_percentage=0.3):
+    spec = spec.copy()
+    num_mel_channels = spec.shape[0]
+    num_time_steps = spec.shape[1]
+
+    for _ in range(num_mask):
+        # 頻率遮擋
+        freq_percentage = np.random.uniform(0.0, freq_masking_max_percentage)
+        num_freqs_to_mask = int(freq_percentage * num_mel_channels)
+        f0 = np.random.randint(0, num_mel_channels - num_freqs_to_mask)
+        spec[f0:f0 + num_freqs_to_mask, :] = 0
+
+        # 時間遮擋
+        time_percentage = np.random.uniform(0.0, time_masking_max_percentage)
+        num_times_to_mask = int(time_percentage * num_time_steps)
+        t0 = np.random.randint(0, num_time_steps - num_times_to_mask)
+        spec[:, t0:t0 + num_times_to_mask] = 0
+
+    return spec
+
+
+# %% 更新 extract_features 函數，動態調整 n_fft
+def extract_features(file_path, sample_rate, augment=False):
     data, _ = librosa.load(file_path, sr=sample_rate)
     data = librosa.util.normalize(data)
+
+    if augment:
+        # 隨機選擇應用增強技術
+        if np.random.rand() < 0.5:
+            data = time_stretch(data, rate=np.random.uniform(0.8, 1.2))
+        if np.random.rand() < 0.5:
+            data = pitch_shift(data, sample_rate, n_steps=np.random.randint(-5, 5))
+        if np.random.rand() < 0.5:
+            data = add_noise(data)
+        if np.random.rand() < 0.5:
+            data = time_shift(data)
+        if np.random.rand() < 0.5:
+            ir_signal = np.random.randn(256)  # 用隨機信號進行卷積
+            data = apply_convolution(data, ir_signal)
+
+    # 動態調整 n_fft
+    n_fft = min(2048, len(data))  # n_fft 不得超過音頻長度
 
     # Mel 頻譜特徵
     mel_spec_obj = af.MelSpectrogram(num=184, samplate=sample_rate, radix2_exp=10)
     mel_spec_arr = mel_spec_obj.spectrogram(data)
     mel_spec_dB_arr = af.utils.power_to_db(mel_spec_arr)
-    mel_shape = mel_spec_dB_arr.shape  # 保存 Mel 頻譜的形狀 (1, H, W)
+
+    # SpecAugment
+    if augment and np.random.rand() < 0.5:
+        mel_spec_dB_arr = spec_augment(mel_spec_dB_arr)
 
     # MFCC 特徵
-    mfccs = librosa.feature.mfcc(y=data, sr=sample_rate, n_mfcc=13)
-    mfccs_resized = np.pad(mfccs, ((0, 0), (0, mel_shape[1] - mfccs.shape[1])), mode='constant')
+    mfccs = librosa.feature.mfcc(y=data, sr=sample_rate, n_mfcc=13, n_fft=n_fft)
 
-    # Waveform 特徵
-    waveform = np.expand_dims(data[:mel_shape[1]], axis=0)
-    waveform_resized = np.pad(waveform, ((0, 0), (0, mel_shape[1] - waveform.shape[1])), mode='constant')
+    # Chroma 特徵
+    chroma = librosa.feature.chroma_stft(y=data, sr=sample_rate, n_fft=n_fft)
 
-    # 返回調整後的特徵
-    return mel_spec_dB_arr, mfccs_resized, waveform_resized
+    # Spectral Contrast 特徵
+    spectral_contrast = librosa.feature.spectral_contrast(y=data, sr=sample_rate, n_fft=n_fft)
+
+    # Zero-Crossing Rate
+    zero_crossing_rate = librosa.feature.zero_crossing_rate(y=data)
+
+    # RMSE
+    rmse = librosa.feature.rms(y=data)
+
+    # Tonnetz
+    tonnetz = librosa.feature.tonnetz(y=data, sr=sample_rate)
+
+    # Spectral Bandwidth
+    spectral_bandwidth = librosa.feature.spectral_bandwidth(y=data, sr=sample_rate)
+
+    # Spectral Flatness
+    spectral_flatness = librosa.feature.spectral_flatness(y=data)
+
+    features = [
+        mel_spec_dB_arr,
+        mfccs,
+        chroma,
+        spectral_contrast,
+        zero_crossing_rate,
+        rmse,
+        tonnetz,
+        spectral_bandwidth,
+        spectral_flatness
+    ]
+
+    # 獲取最大高度和寬度
+    max_height = max(f.shape[0] for f in features)
+    max_width = max(f.shape[1] for f in features)
+
+    padded_features = []
+    for feature in features:
+        # 填充高度和寬度
+        height_padding = max_height - feature.shape[0]
+        width_padding = max_width - feature.shape[1]
+
+        # 循環填充特徵，保證不使用0或null進行填充，而是用自身數據
+        padded_feature = np.pad(
+            feature,
+            ((0, height_padding), (0, width_padding)),
+            mode='wrap'  # 使用數據循環填充
+        )
+        padded_features.append(padded_feature)
+
+    return np.array(padded_features)
+
 
 # %% 處理音訊
 def process_audio(fileList, sample_rate):
     audio_features = []
+
     max_height, max_width = 0, 0
 
-    # 確定所有樣本中的最大高度和寬度
+    # 首先找到所有特征中的最大高度和宽度
     for file in fileList:
-        mel_spec, mfccs, waveform = extract_features(file, sample_rate)
-        max_height = max(max_height, mel_spec.shape[0], mfccs.shape[0], waveform.shape[0])
-        max_width = max(max_width, mel_spec.shape[1], mfccs.shape[1], waveform.shape[1])
+        features = extract_features(file, sample_rate)
+        max_height = max(max_height, features.shape[1])  # H
+        max_width = max(max_width, features.shape[2])    # W
+        audio_features.append(features)
 
-    # 將所有特徵統一填充到最大長寬
-    for file in fileList:
-        mel_spec, mfccs, waveform = extract_features(file, sample_rate)
+    # 对每个特征进行统一的填充
+    padded_audio_features = []
+    for features in audio_features:
+        # 填充高度和宽度到最大值
+        height_padding = max_height - features.shape[1]
+        width_padding = max_width - features.shape[2]
 
-        mel_spec_padded = np.pad(mel_spec, ((0, max_height - mel_spec.shape[0]), (0, max_width - mel_spec.shape[1])),
-                                 mode='wrap')
-        mfccs_padded = np.pad(mfccs, ((0, max_height - mfccs.shape[0]), (0, max_width - mfccs.shape[1])),
-                              mode='wrap')
-        waveform_padded = np.pad(waveform, ((0, max_height - waveform.shape[0]), (0, max_width - waveform.shape[1])),
-                                 mode='wrap')
+        padded_feature = np.pad(
+            features,
+            ((0, 0), (0, height_padding), (0, width_padding)),
+            mode='wrap'  # 使用數據循環填充，而不是常量填充
+        )
+        padded_audio_features.append(padded_feature)
 
-        print(f"mel_spec_padded shape: {mel_spec_padded.shape}, mfccs_padded shape: {mfccs_padded.shape}, waveform_padded shape: {waveform_padded.shape}")
+    return np.array(padded_audio_features)
 
-        combined_features = np.stack([mel_spec_padded, mfccs_padded, waveform_padded], axis=0)
-        audio_features.append(combined_features)
 
-    return np.array(audio_features)
 
 # %% 訓練與測試
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=25, patience=5):
@@ -277,20 +410,20 @@ if __name__ == "__main__":
     # DataLoader
     train_dataset = TensorDataset(train_data, train_labels)
     val_dataset = TensorDataset(val_data, val_labels)
-    batch_size = 64
+    batch_size = 32
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     # 帶注意力機制和多模態輸入的 EfficientNetV2
-    model = MultiModalEfficientNetV2WithAttention(num_classes=5, dropout_rate=0.5)
+    model = CRNN(num_classes=5, dropout_rate=0.5, lstm_hidden_size=32, lstm_num_layers=1)
 
     # 損失函數和優化器
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.00003, weight_decay=0.01)
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
 
     # 訓練包括early stop的耐心
-    train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=200, patience=5)
+    train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=200, patience=40)
 
     # 評估
     y_true, y_pred = evaluate_model(model, val_loader)
