@@ -5,7 +5,7 @@ code/
 mel.ipynb
 .idea/
 mel_1130816_fixTrainTest_2fold.ipynb
-
+training_data/
 *.yml
 *.pth
 *.png

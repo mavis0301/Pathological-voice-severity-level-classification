@@ -19,7 +19,7 @@ from parselmouth.praat import call
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# Early stopping class
+
 class EarlyStopping:
     def __init__(self, patience=5, delta=0):
         self.patience = patience
@@ -48,6 +48,40 @@ class EarlyStopping:
     def save_checkpoint(self, val_loss, model):
         self.best_loss = val_loss
         torch.save(model.state_dict(), 'checkpoint.pth')
+
+
+# 動態調整 batch size 函數
+def adjust_batch_size(feature_shape, available_memory, safety_factor=0.8):
+    """
+    根據可用的 GPU 顯存動態調整 batch size
+    :param feature_shape: 每個特徵的形狀 (e.g., (channels, height, width))
+    :param available_memory: 可用的顯存大小 (以 bytes 為單位)
+    :param safety_factor: 安全係數，防止超過可用顯存，默認為0.8
+    :return: 動態調整後的 batch size
+    """
+    feature_size = torch.prod(torch.tensor(feature_shape)).item() * 4  # 每個浮點數佔用4 bytes
+    max_batch_size = int(safety_factor * available_memory / feature_size)
+
+    # 確保 batch size 合理
+    batch_size = max(1, max_batch_size)
+    return batch_size
+
+# 動態獲取可用顯存並計算 batch size
+def get_dynamic_batch_size(sample_feature):
+    feature_shape = sample_feature.shape  # 特徵的形狀
+
+    # 獲取可用 GPU 顯存
+    if torch.cuda.is_available():
+        available_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_reserved()
+    else:
+        # 如果沒有 GPU，可用內存設置為一個合理的值（例如 4GB）
+        available_memory = 4 * 1024 ** 3  # 4GB
+
+    # 計算 batch size
+    batch_size = adjust_batch_size(feature_shape, available_memory)
+
+    print(f"動態調整後的 batch size: {batch_size}")
+    return batch_size
 
 # %% Channel Attention Module
 class ChannelAttention(nn.Module):
@@ -126,6 +160,53 @@ class CRNN(nn.Module):
         x = self.dropout(x)
         x = self.classifier(x)
         return x
+
+
+class CustomAudioDataset(Dataset):
+    def __init__(self, file_list, labels, sample_rate, max_height, max_width, augment=False):
+        self.file_list = file_list
+        self.labels = labels
+        self.sample_rate = sample_rate
+        self.max_height = max_height
+        self.max_width = max_width
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        file_path = self.file_list[idx]
+        label = self.labels[idx]
+        features = extract_features(file_path, self.sample_rate, augment=self.augment)
+        features = pad_features(features, self.max_height, self.max_width)
+        features = torch.tensor(features, dtype=torch.float32)
+        label = torch.tensor(label, dtype=torch.long)
+        return features, label
+
+# %% 提取特徵時計算最大高度和寬度
+def calculate_max_dimensions(file_list, sample_rate):
+    max_height, max_width = 0, 0
+    for file in tqdm(file_list, desc="Calculating max dimensions"):
+        features = extract_features(file, sample_rate)
+        max_height = max(max_height, features.shape[1])  # H
+        max_width = max(max_width, features.shape[2])    # W
+    return max_height, max_width
+
+# %% 填充特徵函數
+def pad_features(features, max_height, max_width):
+    # 填充高度和寬度到最大值
+    height_padding = max_height - features.shape[1]
+    width_padding = max_width - features.shape[2]
+
+    padded_features = []
+    for feature in features:
+        padded_feature = np.pad(
+            feature,
+            ((0, 0), (0, height_padding), (0, width_padding)),
+            mode='wrap'  # 使用數據循環填充
+        )
+        padded_features.append(padded_feature)
+    return np.array(padded_features)
 
 
 # %% 動態調整 Dropout
@@ -304,7 +385,6 @@ def process_audio(fileList, sample_rate):
 # %% 訓練與測試
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=25, patience=5):
     model = model.to(device)
-    dynamic_dropout = DynamicDropout(0.5)
     early_stopping = EarlyStopping(patience=patience)
 
     for epoch in range(num_epochs):
@@ -312,8 +392,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         running_loss = 0.0
         correct = 0
         total = 0
-
-        dynamic_dropout.update_dropout_rate(epoch)
 
         for batch_idx, (inputs, labels) in enumerate(train_loader):
             inputs, labels = inputs.to(device), labels.to(device)
@@ -352,7 +430,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 
     print("Training complete")
 
-# %%
+# %% 評估模型
 def evaluate_model(model, test_loader, criterion=None):
     model.eval()
     y_true, y_pred = [], []
@@ -382,13 +460,14 @@ def evaluate_model(model, test_loader, criterion=None):
     else:
         return y_true, y_pred
 
-# %% MAIN
+
+# %% 主程序
 if __name__ == "__main__":
     nowDate = '0910'
     sample_rate = 16000
-    wav_path = "E13_0705data/"
-    train_df = pd.read_csv('2_fold_data_set/two_fold_1.csv', dtype={'ID': str})
-    val_df = pd.read_csv('2_fold_data_set/two_fold_2.csv', dtype={'ID': str})
+    wav_path = "training_data/"
+    train_df = pd.read_csv('2_fold_data_set/train.csv', dtype={'ID': str})
+    val_df = pd.read_csv('2_fold_data_set/val.csv', dtype={'ID': str})
     train_df['ID'] = train_df['ID'].astype(str).str.zfill(4)
     val_df['ID'] = val_df['ID'].astype(str).str.zfill(4)
 
@@ -397,35 +476,33 @@ if __name__ == "__main__":
     X_val_filename = val_df['ID'].apply(lambda x: os.path.join(wav_path, f"{x}.wav")).tolist()
     y_val_label = np.array(val_df['E'])
 
-    # 處理音訊，提取多模態特徵
-    train_audio = process_audio(X_train_filename, sample_rate)
-    val_audio = process_audio(X_val_filename, sample_rate)
+    # 計算最大高度和寬度（為了填充特徵）
+    max_height, max_width = calculate_max_dimensions(X_train_filename + X_val_filename, sample_rate)
 
-    # 轉為 PyTorch tensor
-    train_data = torch.tensor(train_audio, dtype=torch.float32)
-    train_labels = torch.tensor(y_train_label, dtype=torch.long)
-    val_data = torch.tensor(val_audio, dtype=torch.float32)
-    val_labels = torch.tensor(y_val_label, dtype=torch.long)
+    # 創建 Dataset 和 DataLoader
+    train_dataset = CustomAudioDataset(X_train_filename, y_train_label, sample_rate, max_height, max_width, augment=True)
+    val_dataset = CustomAudioDataset(X_val_filename, y_val_label, sample_rate, max_height, max_width, augment=False)
 
-    # DataLoader
-    train_dataset = TensorDataset(train_data, train_labels)
-    val_dataset = TensorDataset(val_data, val_labels)
-    batch_size = 32
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    # 從一個樣本中獲取特徵，用於計算 batch size
+    sample_feature, _ = train_dataset[0]
 
-    # 帶注意力機制和多模態輸入的 EfficientNetV2
+    # 動態計算 batch size
+    batch_size = get_dynamic_batch_size(sample_feature)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+
+    # 初始化模型、損失函數、優化器等
     model = CRNN(num_classes=5, dropout_rate=0.5, lstm_hidden_size=32, lstm_num_layers=1)
 
-    # 損失函數和優化器
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
 
-    # 訓練包括early stop的耐心
+    # 訓練模型
     train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=200, patience=40)
 
-    # 評估
+    # 評估模型
     y_true, y_pred = evaluate_model(model, val_loader)
     report = classification_report(y_true, y_pred, target_names=['Class 0', 'Class 1', 'Class 2', 'Class 3'], digits=4)
     print(report)
